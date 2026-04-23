@@ -8,14 +8,17 @@ on:
 
 jobs:
   singularity:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Set up SingularityCE
-        uses: eWaterCycle/setup-singularity@v7
-        with:
-          singularity-version: 4.1.5
+      - name: Install Singularity
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y singularity-container
+
+      - name: Show Singularity version
+        run: singularity --version
 
       - name: Cache .sif image
         id: cache-sif
