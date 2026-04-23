@@ -1,0 +1,51 @@
+[project]
+description = "A starter template for marimo notebooks with uv"
+name = "marimo-template"
+requires-python = ">=3.12"
+version = "0.1.0"
+
+[dependency-groups]
+dev = [
+  "pre-commit>=4.5.1",
+  "pytest>=9.0.3",
+  "ruff>=0.15.11",
+  "marimo>=0.23.1",
+  "notebook>=7",
+  "ipykernel>=6",
+  "nbdime>=4",
+  "ty>=0.0.31",
+  "folium>=0.17",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["./src"]
+testpaths = ["tests", "marimo_template"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "E", # pycodestyle
+  "F", # pyflakes
+  "I", # isort
+  "B", # flake8-bugbear
+]
+
+[tool.ty.environment]
+root = ["./src", "."]
+
+[tool.ty.src]
+include = ["src", "tests", "notebooks"]
+
+[tool.marimo.save]
+autosave = "after_delay"
+autosave_delay = 1000
+format_on_save = true
+
+[tool.marimo.package_management]
+manager = "uv"
+
+[tool.marimo.runtime]
+pythonpath = ["./src"]

@@ -1,0 +1,67 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+
+%labels
+    Author ReoHakase
+    Project marimo-uv-starter-template
+    Description "CUDA 12.8 + cuDNN + Python 3.12 + uv. Compatible with RTX 5060 Ti (Blackwell, sm_120)."
+
+%help
+    SingularityCE image for the marimo + jupyter + uv starter template.
+
+    Build:
+        sudo singularity build container.sif container.def
+
+    Run (GPU required: always pass --nv):
+        singularity exec --nv --bind $(pwd):/workspace container.sif \
+            bash -c "cd /workspace && uv sync"
+        singularity exec --nv --bind $(pwd):/workspace container.sif \
+            bash -c "cd /workspace && uv run pytest"
+
+    Interactive shell:
+        singularity shell --nv --bind $(pwd):/workspace container.sif
+
+    marimo (open http://localhost:2718):
+        singularity exec --nv --bind $(pwd):/workspace container.sif \
+            bash -c "cd /workspace && uv run marimo edit --host 0.0.0.0 --port 2718 notebooks/"
+
+    Jupyter Notebook (open http://localhost:8888):
+        singularity exec --nv --bind $(pwd):/workspace container.sif \
+            bash -c "cd /workspace && uv run jupyter notebook --ip 0.0.0.0 --port 8888 --no-browser notebooks/"
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        build-essential \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+        python3-pip
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+    mkdir -p /workspace
+
+%environment
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+    export PATH=/usr/local/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:${PATH}
+    export LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+    export PYTHONNOUSERSITE=1
+    export UV_PYTHON=/usr/bin/python3.12
+    export UV_LINK_MODE=copy
+    export UV_PROJECT_ENVIRONMENT=/workspace/.venv-sif
+
+%runscript
+    cd /workspace
+    exec uv run "$@"

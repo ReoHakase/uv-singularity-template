@@ -1,0 +1,34 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.venv-sif/
+
+# Singularity
+*.sif
+
+# IDE
+!.vscode/
+
+# Pytest
+.pytest_cache/
+
+# Ruff
+.ruff_cache/
+
+# Marimo
+.marimo/
+__marimo__/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# misc
+.env*
+!.envrc
