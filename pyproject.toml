@@ -33,6 +33,10 @@ select = [
   "B", # flake8-bugbear
 ]
 
+[tool.ruff.lint.per-file-ignores]
+".agents/**/*.py" = ["B018"]
+"notebooks/*.py" = ["B018"]
+
 [tool.ty.environment]
 root = ["./src", "."]
 
