@@ -38,7 +38,6 @@ from dotenv import load_dotenv
 # module docstring above. Replace this with your provider of choice.
 from huggingface_hub import run_uv_job
 
-
 PROJECT_DIR = Path(__file__).resolve().parent
 NOTEBOOK_PATH = PROJECT_DIR / "starting-point.py"
 
