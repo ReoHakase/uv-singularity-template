@@ -39,6 +39,7 @@ From: {{ base_image }}
     apt-get update
     apt-get install -y --no-install-recommends \
         ca-certificates \
+        bubblewrap \
         curl \
         direnv \
         git \
@@ -88,7 +89,9 @@ From: {{ base_image }}
 set -eu
 
 : "${NP_LOCATION:=/workspace/.container/state/nix-portable}"
-: "${NP_RUNTIME:=proot}"
+: "${NP_RUNTIME:=bwrap}"
+# SingularityCE の fakeroot build 中に proot を使うと ptrace が壊れることがある。
+# bwrap を既定にして、proot が必要な環境だけ NP_RUNTIME=proot で上書きする。
 # nix-portable 実行中も apt で入れた Git を使う。
 # Git の bootstrap まで Nix closure に寄せると、初回実行時の失敗原因が追いにくくなる。
 : "${NP_GIT:=/usr/bin/git}"
@@ -159,7 +162,9 @@ case "$XDG_STATE_HOME" in
     *) export XDG_STATE_HOME="$HOME/.local/state" ;;
 esac
 export NP_LOCATION="${NP_LOCATION:-$HPCDEV_STATE_DIR/nix-portable}"
-export NP_RUNTIME="${NP_RUNTIME:-proot}"
+export NP_RUNTIME="${NP_RUNTIME:-bwrap}"
+# SingularityCE の fakeroot build 中に proot を使うと ptrace が壊れることがある。
+# bwrap を既定にして、proot が必要な環境だけ NP_RUNTIME=proot で上書きする。
 # nix-portable の内側でも apt 側の Git を使う。
 # これにより Nix seed 展開前でも flake の fetch が安定する。
 export NP_GIT="${NP_GIT:-/usr/bin/git}"
@@ -543,7 +548,7 @@ HPCDEV
     # ---- flake.nix#default の bake --------------------------------------------------
     # flake.nix#default はリポジトリ固有の実行依存として常に bake する。
     export NP_LOCATION=/opt/hpcdev/baked/nix-portable-seed
-    export NP_RUNTIME=proot
+    export NP_RUNTIME=bwrap
     export NP_GIT=/usr/bin/git
     export NIX_CONFIG='experimental-features = nix-command flakes
 accept-flake-config = true
@@ -627,7 +632,7 @@ sandbox = false'
     export UV_PROJECT_ENVIRONMENT=/workspace/.venv-sif
     export UV_CACHE_DIR=/workspace/.container/state/uv-cache
     export NP_LOCATION=/workspace/.container/state/nix-portable
-    export NP_RUNTIME=proot
+    export NP_RUNTIME=bwrap
     export NP_GIT=/usr/bin/git
     export NIX_CONFIG="experimental-features = nix-command flakes
 accept-flake-config = true

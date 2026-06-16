@@ -73,7 +73,7 @@ singularity exec --cleanenv --no-home --nv \
 
 | 層                       | 扱うもの                                           | 例                                                |
 | ------------------------ | -------------------------------------------------- | ------------------------------------------------- |
-| `%post` の `apt-get`     | コンテナ内で最低限の開発ホストとして必要な CLI    | `zsh`, `curl`, `tmux`, `openssh`, `git`, `git-lfs`, `direnv` |
+| `%post` の `apt-get`     | コンテナ内で最低限の開発ホストとして必要な CLI    | `zsh`, `curl`, `tmux`, `openssh`, `git`, `git-lfs`, `direnv`, `bubblewrap` |
 | `flake.nix#default`      | リポジトリ固有の実行依存、Python から呼ぶ外部依存 | `uv`, `ffmpeg`, `p7zip`, `unzip`, `zstd`, `cacert`, `nix-direnv` |
 | dotfiles                 | 個人のシェル、エディタ、Git、好みの開発道具       | `nvim`, `starship`, `mise`, `gh`, 個人設定         |
 
