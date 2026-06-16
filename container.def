@@ -1,67 +1,653 @@
+# この定義ファイルは、ホストに Nix が入っていない共用 GPU 環境を想定する。
+# 入口は SingularityCE だけにし、開発用の状態ファイルは実行時に bind した
+# リポジトリ配下の .container/ に閉じ込める。
 Bootstrap: docker
-From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+From: {{ base_image }}
+
+%arguments
+    base_image=pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
+    bake_dotfiles=0
+    bake_codex=0
+    bake_claude=0
+    DOTFILES_REPOSITORY=__unset__
+    nix_portable_version=v012
+    sshd_port=2222
+
+%files
+    flake.nix /opt/hpcdev/baked/flake/flake.nix
+    flake.lock /opt/hpcdev/baked/flake/flake.lock
 
 %labels
     Author ReoHakase
-    Project marimo-uv-starter-template
-    Description "CUDA 12.8 + cuDNN + Python 3.12 + uv. Compatible with RTX 5060 Ti (Blackwell, sm_120)."
+    Project uv-singularity-template
+    Description "Single CUDA/PyTorch HPC development image with baked nix-portable."
 
 %help
-    SingularityCE image for the marimo + jupyter + uv starter template.
+    root 権限のない NVIDIA GPU 環境で使う hpcdev SIF です。
 
-    Build:
-        sudo singularity build container.sif container.def
-
-    Run (GPU required: always pass --nv):
-        singularity exec --nv --bind $(pwd):/workspace container.sif \
-            bash -c "cd /workspace && uv sync"
-        singularity exec --nv --bind $(pwd):/workspace container.sif \
-            bash -c "cd /workspace && uv run pytest"
-
-    Interactive shell:
-        singularity shell --nv --bind $(pwd):/workspace container.sif
-
-    marimo (open http://localhost:2718):
-        singularity exec --nv --bind $(pwd):/workspace container.sif \
-            bash -c "cd /workspace && uv run marimo edit --host 0.0.0.0 --port 2718 notebooks/"
-
-    Jupyter Notebook (open http://localhost:8888):
-        singularity exec --nv --bind $(pwd):/workspace container.sif \
-            bash -c "cd /workspace && uv run jupyter notebook --ip 0.0.0.0 --port 8888 --no-browser notebooks/"
+    singularity build --fakeroot container.sif container.def
+    singularity run --cleanenv --no-home --nv --bind "$PWD:/workspace,$HOME/.ssh/authorized_keys:/authorized_keys:ro" --pwd /workspace container.sif init
+    singularity instance start --cleanenv --no-home --nv --bind "$PWD:/workspace,$HOME/.ssh/authorized_keys:/authorized_keys:ro" --pwd /workspace container.sif dev-container
 
 %post
-    export DEBIAN_FRONTEND=noninteractive
+    set -eu
 
+    # ここは SIF build 中に root 権限相当で実行される。
+    # 共用環境では --fakeroot でこの %post を通す想定。
+    # apt にはコンテナを「最低限の開発ホスト」として動かす道具だけを入れる。
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        direnv \
         git \
-        build-essential \
-        python3.12 \
-        python3.12-dev \
-        python3.12-venv \
-        python3-pip
-    ln -sf /usr/bin/python3.12 /usr/local/bin/python
-    ln -sf /usr/bin/python3.12 /usr/local/bin/python3
-
-    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
-
-    apt-get clean
+        git-lfs \
+        openssh-client \
+        openssh-server \
+        tmux \
+        zsh
     rm -rf /var/lib/apt/lists/*
 
-    mkdir -p /workspace
+    mkdir -p /opt/hpcdev/bin /opt/hpcdev/baked /workspace /run/sshd
+    touch /authorized_keys
+    case "{{ bake_codex }}" in
+        0|1) ;;
+        *)
+            echo "bake_codex must be 0 or 1." >&2
+            exit 66
+            ;;
+    esac
+    case "{{ bake_claude }}" in
+        0|1) ;;
+        *)
+            echo "bake_claude must be 0 or 1." >&2
+            exit 66
+            ;;
+    esac
+
+    # ---- nix-portable と Nix wrapper -------------------------------------------------
+    # nix-portable は SIF に焼き込む。実行時の Nix store は
+    # NP_LOCATION=/workspace/.container/state/nix-portable に置くので、ホストの /nix は使わない。
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64) nix_portable_asset=nix-portable-x86_64 ;;
+        aarch64|arm64) nix_portable_asset=nix-portable-aarch64 ;;
+        *)
+            echo "unsupported architecture for nix-portable: $arch" >&2
+            exit 65
+            ;;
+    esac
+    curl -fL --retry 3 --retry-delay 2 \
+        -o /opt/hpcdev/bin/nix-portable \
+        "https://github.com/DavHau/nix-portable/releases/download/{{ nix_portable_version }}/${nix_portable_asset}"
+    chmod 755 /opt/hpcdev/bin/nix-portable
+    for name in nix nix-build nix-channel nix-collect-garbage nix-copy-closure nix-daemon nix-env nix-hash nix-instantiate nix-prefetch-url nix-shell nix-store; do
+        cat >"/opt/hpcdev/bin/$name" <<'NIX_WRAPPER'
+#!/usr/bin/env sh
+set -eu
+
+: "${NP_LOCATION:=/workspace/.container/state/nix-portable}"
+: "${NP_RUNTIME:=proot}"
+# nix-portable 実行中も apt で入れた Git を使う。
+# Git の bootstrap まで Nix closure に寄せると、初回実行時の失敗原因が追いにくくなる。
+: "${NP_GIT:=/usr/bin/git}"
+export NP_LOCATION NP_RUNTIME NP_GIT
+
+mkdir -p "$NP_LOCATION"
+exec /opt/hpcdev/bin/nix-portable "$(basename "$0")" "$@"
+NIX_WRAPPER
+        chmod 755 "/opt/hpcdev/bin/$name"
+    done
+
+    # ---- SIF 内 dispatcher ----------------------------------------------------------
+    # hpcdev は SIF 内にだけ存在する dispatcher。
+    # リポジトリには .container/run のような shell script を置かない。
+    cat >/opt/hpcdev/bin/hpcdev <<'HPCDEV'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HPCDEV_REPO_DIR="${HPCDEV_REPO_DIR:-/workspace}"
+case "$HPCDEV_REPO_DIR" in
+    /workspace|/workspace/*) ;;
+    *) export HPCDEV_REPO_DIR=/workspace ;;
+esac
+export HPCDEV_ROOT="$HPCDEV_REPO_DIR/.container"
+export HPCDEV_STATE_DIR="$HPCDEV_ROOT/state"
+export HPCDEV_SSHD_PORT="${HPCDEV_SSHD_PORT:-{{ sshd_port }}}"
+export HOME="$HPCDEV_ROOT/home"
+export USER="${USER:-$(id -un 2>/dev/null || echo hpcdev)}"
+export LOGNAME="${LOGNAME:-$USER}"
+
+# ホスト側の Home Manager/Nix/Python 環境が漏れると、profile や import 先が
+# /home/<user> などリポジトリ外へ向くため、コンテナ内の値に固定する。
+unset NIX_PATH NIX_SSL_CERT_FILE PYTHONPATH PYTHONHOME __HM_SESS_VARS_SOURCED
+export NIX_PROFILE="$HOME/.nix-profile"
+export NIX_USER_PROFILE_DIR="$HOME/.local/state/nix/profiles"
+export NIX_PROFILES="/nix/var/nix/profiles/default $NIX_PROFILE"
+
+export CODEX_HOME="${CODEX_HOME:-$HPCDEV_STATE_DIR/codex}"
+export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HPCDEV_STATE_DIR/claude}"
+export VSCODE_AGENT_FOLDER="${VSCODE_AGENT_FOLDER:-$HPCDEV_STATE_DIR/vscode-server}"
+export CURSOR_SERVER_DATA_DIR="${CURSOR_SERVER_DATA_DIR:-$HPCDEV_STATE_DIR/cursor-server}"
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$HPCDEV_REPO_DIR/.venv-sif}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$HPCDEV_STATE_DIR/uv-cache}"
+
+# ssh 経由の起動ではホスト側の XDG_* が混ざることがある。
+# そのままだと direnvrc や cache が .container/home の外へ書かれるため、
+# コンテナ内 HOME 配下だけを許可する。
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+case "$XDG_CACHE_HOME" in
+    "$HOME"|"$HOME"/*) ;;
+    *) export XDG_CACHE_HOME="$HOME/.cache" ;;
+esac
+case "$XDG_CONFIG_HOME" in
+    "$HOME"|"$HOME"/*) ;;
+    *) export XDG_CONFIG_HOME="$HOME/.config" ;;
+esac
+case "$XDG_DATA_HOME" in
+    "$HOME"|"$HOME"/*) ;;
+    *) export XDG_DATA_HOME="$HOME/.local/share" ;;
+esac
+case "$XDG_STATE_HOME" in
+    "$HOME"|"$HOME"/*) ;;
+    *) export XDG_STATE_HOME="$HOME/.local/state" ;;
+esac
+export NP_LOCATION="${NP_LOCATION:-$HPCDEV_STATE_DIR/nix-portable}"
+export NP_RUNTIME="${NP_RUNTIME:-proot}"
+# nix-portable の内側でも apt 側の Git を使う。
+# これにより Nix seed 展開前でも flake の fetch が安定する。
+export NP_GIT="${NP_GIT:-/usr/bin/git}"
+export NIX_CONFIG="${NIX_CONFIG:-experimental-features = nix-command flakes
+accept-flake-config = true
+sandbox = false}"
+
+if [ -d /.singularity.d/libs ]; then
+    export LD_LIBRARY_PATH="/.singularity.d/libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+export PATH="/opt/hpcdev/bin:/opt/conda/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+hpcdev_prepare_dirs() {
+    mkdir -p \
+        "$HPCDEV_ROOT" "$HOME/.ssh" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$XDG_CONFIG_HOME/direnv" \
+        "$HPCDEV_STATE_DIR"/{cursor-server,dotfiles,flake,sshd,uv-cache,vscode-server}
+    chmod 700 "$HOME" "$HOME/.ssh" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$HPCDEV_STATE_DIR/sshd" 2>/dev/null || true
+}
+
+hpcdev_extract_nix_seed() {
+    if [ -d /opt/hpcdev/baked/nix-portable-seed ]; then
+        local seed_marker="$NP_LOCATION/.container-seed-extracted"
+        if [ ! -e "$seed_marker" ]; then
+            if [ -d "$NP_LOCATION/.nix-portable/nix/store" ]; then
+                touch "$seed_marker" 2>/dev/null || true
+            else
+                rm -rf "$NP_LOCATION"
+                mkdir -p "$NP_LOCATION"
+                # bake 時の Nix DB lock や一時 root は runtime へ持ち込まない。
+                # これらが残ると、実行時の mutable な Nix store で lock 待ちや権限エラーに見える。
+                tar \
+                    --exclude='./.nix-portable/nix/var/nix/db/big-lock' \
+                    --exclude='./.nix-portable/nix/var/nix/db/reserved' \
+                    --exclude='./.nix-portable/nix/var/nix/gc.lock' \
+                    --exclude='./.nix-portable/nix/var/nix/temproots/*' \
+                    -C /opt/hpcdev/baked/nix-portable-seed \
+                    -cf - . | tar -C "$NP_LOCATION" -xf -
+                touch "$seed_marker"
+            fi
+        fi
+    fi
+}
+
+hpcdev_link_authorized_keys() {
+    # authorized_keys はホストの ~/.ssh 全体ではなく、公開鍵リスト 1 ファイルだけを
+    # /authorized_keys に read-only bind して使う。秘密鍵は見せない。
+    if [ -s /authorized_keys ] &&
+        [ ! -e "$HOME/.ssh/authorized_keys" ] &&
+        [ ! -L "$HOME/.ssh/authorized_keys" ]; then
+        ln -s /authorized_keys "$HOME/.ssh/authorized_keys"
+    elif { [ -e "$HPCDEV_ROOT/authorized_keys" ] || [ -L "$HPCDEV_ROOT/authorized_keys" ]; } &&
+        [ ! -e "$HOME/.ssh/authorized_keys" ] &&
+        [ ! -L "$HOME/.ssh/authorized_keys" ]; then
+        ln -s "$HPCDEV_ROOT/authorized_keys" "$HOME/.ssh/authorized_keys"
+    fi
+    if [ -e "$HOME/.ssh/authorized_keys" ] && [ ! -L "$HOME/.ssh/authorized_keys" ]; then
+        chmod 600 "$HOME/.ssh/authorized_keys" 2>/dev/null || true
+    fi
+}
+
+hpcdev_prepare_flake_copy() {
+    # Nix に /workspace 全体を flake input として読ませると、
+    # .container/state/nix-portable までコピー対象になってしまう。
+    # flake.nix と flake.lock だけを状態ディレクトリへ逃がして、そこを読む。
+    if [ -f "$HPCDEV_REPO_DIR/flake.nix" ]; then
+        cp "$HPCDEV_REPO_DIR/flake.nix" "$HPCDEV_STATE_DIR/flake/flake.nix"
+    fi
+    if [ -f "$HPCDEV_REPO_DIR/flake.lock" ]; then
+        cp "$HPCDEV_REPO_DIR/flake.lock" "$HPCDEV_STATE_DIR/flake/flake.lock"
+    fi
+}
+
+hpcdev_configure_direnv() {
+    command -v direnv >/dev/null 2>&1 || return 0
+    mkdir -p "$XDG_CONFIG_HOME/direnv"
+    cat >"$XDG_CONFIG_HOME/direnv/direnvrc" <<'DIRENVRC'
+# hpcdev が生成する direnv 設定。
+# use flake を使うため、nix-direnv はこのリポジトリの flake.nix#default から読む。
+_hpcdev_state_dir="${HPCDEV_STATE_DIR:-/workspace/.container/state}"
+_hpcdev_flake_profile="$_hpcdev_state_dir/flake-profile"
+_hpcdev_flake_path="path:$_hpcdev_state_dir/flake"
+
+if [ ! -f "$_hpcdev_flake_profile/share/nix-direnv/direnvrc" ] &&
+    command -v nix >/dev/null 2>&1; then
+    nix build --out-link "$_hpcdev_flake_profile" "$_hpcdev_flake_path#default" >/dev/null 2>&1 || true
+fi
+
+if [ -f "$_hpcdev_flake_profile/share/nix-direnv/direnvrc" ]; then
+    source "$_hpcdev_flake_profile/share/nix-direnv/direnvrc"
+fi
+
+unset _hpcdev_state_dir _hpcdev_flake_profile _hpcdev_flake_path
+DIRENVRC
+}
+
+# /workspace はホスト側のリポジトリを bind した場所。
+# home/state は /workspace/.container に作り、リポジトリ外を汚さない。
+hpcdev_init() {
+    hpcdev_prepare_dirs
+    hpcdev_extract_nix_seed
+    hpcdev_link_authorized_keys
+    hpcdev_prepare_flake_copy
+    hpcdev_configure_direnv
+}
+
+# dotfiles は任意。個人設定をリポジトリに固定しないため、Dev Containers の
+# dotfiles 設定を shell で扱いやすい DOTFILES_* 環境変数として受け取る。
+hpcdev_install_dotfiles() {
+    hpcdev_init
+
+    local dotfiles_repo
+    local dotfiles_dir
+    local install_cmd
+    dotfiles_repo="${DOTFILES_REPOSITORY:-}"
+    dotfiles_dir="${DOTFILES_TARGET_PATH:-}"
+    install_cmd="${DOTFILES_INSTALL_COMMAND:-}"
+
+    dotfiles_dir="${dotfiles_dir:-$HOME/dotfiles}"
+    case "$dotfiles_dir" in
+        "~") dotfiles_dir="$HOME" ;;
+        "~/"*) dotfiles_dir="$HOME/${dotfiles_dir#~/}" ;;
+        /*) ;;
+        *) dotfiles_dir="$HOME/$dotfiles_dir" ;;
+    esac
+
+    mkdir -p "$dotfiles_dir"
+    if [ -d "$dotfiles_dir/.git" ]; then
+        git -C "$dotfiles_dir" pull --ff-only
+    elif [ -d /opt/hpcdev/baked/dotfiles/.git ]; then
+        rm -rf "$dotfiles_dir"
+        mkdir -p "$(dirname "$dotfiles_dir")"
+        cp -a /opt/hpcdev/baked/dotfiles "$dotfiles_dir"
+    else
+        if [ -z "$dotfiles_repo" ]; then
+            cat >&2 <<'MSG'
+ERROR: DOTFILES_REPOSITORY is required when dotfiles are not baked into the SIF.
+
+Example:
+  DOTFILES_REPOSITORY=https://github.com/you/dotfiles.git \
+  DOTFILES_TARGET_PATH=dotfiles \
+  DOTFILES_INSTALL_COMMAND=./install.sh \
+    singularity run ... install-dotfiles
+MSG
+            exit 66
+        fi
+        if [ -n "$(find "$dotfiles_dir" -mindepth 1 -maxdepth 1 2>/dev/null)" ]; then
+            echo "ERROR: $dotfiles_dir is not empty and is not a git repository." >&2
+            exit 66
+        fi
+        git clone --depth 1 "$dotfiles_repo" "$dotfiles_dir"
+    fi
+
+    cd "$dotfiles_dir"
+
+    if [ -n "$install_cmd" ]; then
+        local first_word
+        local rest_words
+        first_word="${install_cmd%%[[:space:]]*}"
+        rest_words="${install_cmd#"$first_word"}"
+        case "$first_word" in
+            ""|/*|~*|./*|../*) ;;
+            *)
+                if [ -f "$first_word" ]; then
+                    install_cmd="./$first_word$rest_words"
+                fi
+                ;;
+        esac
+    fi
+
+    if [ -z "$install_cmd" ]; then
+        local candidate
+        for candidate in install.sh install bootstrap.sh bootstrap setup.sh setup; do
+            if [ -f "$candidate" ]; then
+                install_cmd="./$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$install_cmd" ]; then
+        local entry
+        local linked_any=0
+        for entry in "$dotfiles_dir"/.[!.]* "$dotfiles_dir"/..?*; do
+            [ -e "$entry" ] || continue
+            [ "$(basename "$entry")" = ".git" ] && continue
+            if [ -e "$HOME/$(basename "$entry")" ] || [ -L "$HOME/$(basename "$entry")" ]; then
+                echo "skip existing $HOME/$(basename "$entry")" >&2
+                continue
+            fi
+            ln -s "$entry" "$HOME/$(basename "$entry")"
+            linked_any=1
+        done
+        if [ "$linked_any" = "1" ]; then
+            echo "dotfiles linked into $HOME; no DOTFILES_INSTALL_COMMAND or default install script found." >&2
+        else
+            echo "dotfiles installed at $dotfiles_dir; no DOTFILES_INSTALL_COMMAND, default install script, or top-level dotfile found." >&2
+        fi
+        return 0
+    fi
+
+    exec bash -lc "$install_cmd"
+}
+
+# Python 実行に必要な外部依存だけを flake から入れる。
+# Nix はホストではなく、SIF 内の nix-portable を使う。
+hpcdev_nix_develop() {
+    hpcdev_init
+    cd "$HPCDEV_REPO_DIR"
+    if [ "$#" -eq 0 ]; then
+        exec nix develop "path:$HPCDEV_STATE_DIR/flake"
+    fi
+    exec nix develop "path:$HPCDEV_STATE_DIR/flake" --command "$@"
+}
+
+# ベースイメージの PyTorch を使うため、venv は system site packages を見せる。
+hpcdev_python() {
+    if [ -n "${HPCDEV_PYTHON:-}" ]; then
+        printf '%s\n' "$HPCDEV_PYTHON"
+        return 0
+    fi
+
+    local candidate
+    for candidate in /opt/conda/bin/python /usr/local/bin/python /usr/bin/python python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+
+    echo "ERROR: Python interpreter not found in the base image." >&2
+    exit 127
+}
+
+hpcdev_uv_sync() {
+    hpcdev_init
+    cd "$HPCDEV_REPO_DIR"
+
+    local python_bin
+    python_bin="$(hpcdev_python)"
+
+    if command -v uv >/dev/null 2>&1; then
+        if [ ! -d "$UV_PROJECT_ENVIRONMENT" ]; then
+            uv venv --system-site-packages --python "$python_bin" "$UV_PROJECT_ENVIRONMENT"
+        fi
+        exec uv sync "$@"
+    fi
+    if [ ! -d "$UV_PROJECT_ENVIRONMENT" ]; then
+        nix develop "path:$HPCDEV_STATE_DIR/flake" --command uv venv --system-site-packages --python "$python_bin" "$UV_PROJECT_ENVIRONMENT"
+    fi
+    exec nix develop "path:$HPCDEV_STATE_DIR/flake" --command uv sync "$@"
+}
+
+# SingularityCE instance の %startscript から呼ばれる。
+# sshd は root daemon ではなく、ユーザー権限で 127.0.0.1:${HPCDEV_SSHD_PORT} に待ち受ける。
+hpcdev_start_sshd() {
+    hpcdev_init
+
+    local port="$HPCDEV_SSHD_PORT"
+    local state_dir="$HPCDEV_STATE_DIR/sshd"
+    local sshd_bin
+    sshd_bin="$(command -v sshd || true)"
+    if [ -z "$sshd_bin" ]; then
+        echo "ERROR: sshd not found" >&2
+        exit 127
+    fi
+    if [ ! -s "$HOME/.ssh/authorized_keys" ]; then
+        cat >&2 <<MSG
+ERROR: $HOME/.ssh/authorized_keys is missing.
+
+Bind your host authorized_keys when starting the container:
+  singularity instance start --cleanenv --no-home --nv \
+    --bind "\$PWD:/workspace,\$HOME/.ssh/authorized_keys:/authorized_keys:ro" \
+    --pwd /workspace \
+    container.sif dev-container
+MSG
+        exit 66
+    fi
+
+    mkdir -p "$state_dir"
+    chmod 700 "$state_dir"
+    if [ ! -f "$state_dir/ssh_host_ed25519_key" ]; then
+        ssh-keygen -t ed25519 -f "$state_dir/ssh_host_ed25519_key" -N ""
+    fi
+
+    cat >"$state_dir/sshd_config" <<SSHD
+HostKey $state_dir/ssh_host_ed25519_key
+PidFile $state_dir/sshd.pid
+ListenAddress 127.0.0.1
+Port $port
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile $HOME/.ssh/authorized_keys
+PermitUserEnvironment no
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+X11Forwarding no
+PermitTTY yes
+PrintMotd no
+StrictModes no
+Subsystem sftp internal-sftp
+ForceCommand /opt/hpcdev/bin/hpcdev ssh-session
+SSHD
+    local env_name
+    for env_name in \
+        CODEX_HOME CLAUDE_CONFIG_DIR HOME NIX_PROFILE NIX_USER_PROFILE_DIR NIX_PROFILES \
+        VSCODE_AGENT_FOLDER CURSOR_SERVER_DATA_DIR PATH LD_LIBRARY_PATH \
+        PYTHONNOUSERSITE UV_PROJECT_ENVIRONMENT UV_CACHE_DIR NP_LOCATION NP_RUNTIME NP_GIT \
+        HPCDEV_REPO_DIR HPCDEV_ROOT HPCDEV_STATE_DIR HPCDEV_SSHD_PORT; do
+        printf 'SetEnv %s=%s\n' "$env_name" "${!env_name-}" >>"$state_dir/sshd_config"
+    done
+
+    echo "starting sshd on 127.0.0.1:$port" >&2
+    exec "$sshd_bin" -D -e -f "$state_dir/sshd_config"
+}
+
+# sshd 経由で入ったときも、HOME や Codex/Cursor の状態置き場を .container 配下に固定する。
+hpcdev_ssh_session() {
+    hpcdev_init
+    cd "$HPCDEV_REPO_DIR"
+    if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+        exec bash -c "$SSH_ORIGINAL_COMMAND"
+    fi
+    exec bash -l
+}
+
+case "${1:-help}" in
+    help|-h|--help)
+        cat <<'MSG'
+container コマンド:
+  init | install-dotfiles | nix-develop | uv-sync | direnv | start-sshd | ssh-session | <command>
+
+よく使う例:
+  singularity run --cleanenv --no-home --nv --bind "$PWD:/workspace,$HOME/.ssh/authorized_keys:/authorized_keys:ro" --pwd /workspace container.sif init
+  singularity run --cleanenv --no-home --nv --bind "$PWD:/workspace,$HOME/.ssh/authorized_keys:/authorized_keys:ro" --pwd /workspace container.sif direnv allow
+  singularity run --cleanenv --no-home --nv --bind "$PWD:/workspace,$HOME/.ssh/authorized_keys:/authorized_keys:ro" --pwd /workspace container.sif direnv exec . bash -lc 'echo "$VIRTUAL_ENV"; uv --version'
+  singularity instance start --cleanenv --no-home --nv --bind "$PWD:/workspace,$HOME/.ssh/authorized_keys:/authorized_keys:ro" --pwd /workspace container.sif dev-container
+MSG
+        ;;
+    init)
+        hpcdev_init
+        ;;
+    install-dotfiles)
+        shift
+        hpcdev_install_dotfiles "$@"
+        ;;
+    nix-develop)
+        shift
+        hpcdev_nix_develop "$@"
+        ;;
+    uv-sync)
+        shift
+        hpcdev_uv_sync "$@"
+        ;;
+    direnv)
+        shift
+        hpcdev_init
+        cd "$HPCDEV_REPO_DIR"
+        exec direnv "$@"
+        ;;
+    start-sshd)
+        shift
+        hpcdev_start_sshd "$@"
+        ;;
+    ssh-session)
+        shift
+        hpcdev_ssh_session "$@"
+        ;;
+    *)
+        hpcdev_init
+        cd "$HPCDEV_REPO_DIR"
+        exec "$@"
+        ;;
+esac
+HPCDEV
+    chmod 755 /opt/hpcdev/bin/hpcdev
+
+    # ---- flake.nix#default の bake --------------------------------------------------
+    # flake.nix#default はリポジトリ固有の実行依存として常に bake する。
+    export NP_LOCATION=/opt/hpcdev/baked/nix-portable-seed
+    export NP_RUNTIME=proot
+    export NP_GIT=/usr/bin/git
+    export NIX_CONFIG='experimental-features = nix-command flakes
+accept-flake-config = true
+sandbox = false'
+    cd /opt/hpcdev/baked/flake
+    /opt/hpcdev/bin/nix-portable nix build --no-link .#default
+    /opt/hpcdev/bin/nix-portable nix develop --command true
+    rm -f \
+        "$NP_LOCATION/.nix-portable/nix/var/nix/db/big-lock" \
+        "$NP_LOCATION/.nix-portable/nix/var/nix/db/reserved" \
+        "$NP_LOCATION/.nix-portable/nix/var/nix/gc.lock" \
+        "$NP_LOCATION/.nix-portable/nix/var/nix/temproots/"*
+
+    # direnv は通常のプロセスとして動くため、nix-direnv が出した
+    # /nix/store/... の PATH を proot なしでも解決できる必要がある。
+    # 実体は実行時に bind される /workspace/.container/state 配下へ置く。
+    if [ -e /nix ] || [ -L /nix ]; then
+        rm -rf /nix
+    fi
+    ln -s /workspace/.container/state/nix-portable/.nix-portable/nix /nix
+
+    # ---- 任意の agent CLI bake ------------------------------------------------------
+    # CLI 本体だけを SIF に含める。認証情報や設定は runtime の .container/state 配下に置く。
+    if [ "{{ bake_codex }}" = "1" ]; then
+        codex_installer=/tmp/codex-install.sh
+        mkdir -p /opt/hpcdev/baked/codex-cli
+        curl -fsSL -o "$codex_installer" https://chatgpt.com/codex/install.sh
+        env \
+            CODEX_NON_INTERACTIVE=1 \
+            CODEX_RELEASE=latest \
+            CODEX_INSTALL_DIR=/opt/hpcdev/bin \
+            CODEX_HOME=/opt/hpcdev/baked/codex-cli \
+            HOME=/opt/hpcdev/baked/codex-cli \
+            PATH="/opt/hpcdev/bin:$PATH" \
+            sh "$codex_installer"
+        rm -f "$codex_installer"
+        env CODEX_HOME=/opt/hpcdev/baked/codex-cli HOME=/opt/hpcdev/baked/codex-cli /opt/hpcdev/bin/codex --version
+    fi
+
+    if [ "{{ bake_claude }}" = "1" ]; then
+        claude_installer=/tmp/claude-install.sh
+        claude_home=/opt/hpcdev/baked/claude-code
+        mkdir -p "$claude_home"
+        curl -fsSL -o "$claude_installer" https://claude.ai/install.sh
+        env \
+            HOME="$claude_home" \
+            PATH="/opt/hpcdev/bin:$PATH" \
+            bash "$claude_installer" latest
+        rm -f "$claude_installer"
+        if [ ! -x "$claude_home/.local/bin/claude" ]; then
+            echo "Claude Code installer did not create $claude_home/.local/bin/claude." >&2
+            exit 66
+        fi
+        ln -sf "$claude_home/.local/bin/claude" /opt/hpcdev/bin/claude
+        rm -rf "$claude_home/.claude" "$claude_home/.claude.json"
+        env HOME="$claude_home" CLAUDE_CONFIG_DIR="$claude_home/.claude" /opt/hpcdev/bin/claude --version
+        rm -rf "$claude_home/.claude" "$claude_home/.claude.json"
+    fi
+
+    # ---- 任意の dotfiles bake -------------------------------------------------------
+    if [ "{{ bake_dotfiles }}" = "1" ]; then
+        # dotfiles の bake は任意。個人設定を template repo に含めないため、
+        # DOTFILES_REPOSITORY は build arg で明示的に渡す。
+        if [ "{{ DOTFILES_REPOSITORY }}" = "__unset__" ]; then
+            echo "bake_dotfiles=1 requires --build-arg DOTFILES_REPOSITORY=..." >&2
+            exit 66
+        fi
+        git clone --depth 1 "{{ DOTFILES_REPOSITORY }}" /opt/hpcdev/baked/dotfiles
+    fi
 
 %environment
+    unset NIX_PATH
+    unset NIX_SSL_CERT_FILE
+    unset PYTHONPATH
+    unset PYTHONHOME
+    unset __HM_SESS_VARS_SOURCED
     export LANG=C.UTF-8
     export LC_ALL=C.UTF-8
-    export PATH=/usr/local/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:${PATH}
-    export LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
     export PYTHONNOUSERSITE=1
-    export UV_PYTHON=/usr/bin/python3.12
     export UV_LINK_MODE=copy
     export UV_PROJECT_ENVIRONMENT=/workspace/.venv-sif
+    export UV_CACHE_DIR=/workspace/.container/state/uv-cache
+    export NP_LOCATION=/workspace/.container/state/nix-portable
+    export NP_RUNTIME=proot
+    export NP_GIT=/usr/bin/git
+    export NIX_CONFIG="experimental-features = nix-command flakes
+accept-flake-config = true
+sandbox = false"
+    export CODEX_HOME=/workspace/.container/state/codex
+    export CLAUDE_CONFIG_DIR=/workspace/.container/state/claude
+    export HOME=/workspace/.container/home
+    export NIX_PROFILE=/workspace/.container/home/.nix-profile
+    export NIX_USER_PROFILE_DIR=/workspace/.container/home/.local/state/nix/profiles
+    export NIX_PROFILES="/nix/var/nix/profiles/default /workspace/.container/home/.nix-profile"
+    export HPCDEV_REPO_DIR=/workspace
+    export HPCDEV_ROOT=/workspace/.container
+    export HPCDEV_STATE_DIR=/workspace/.container/state
+    export HPCDEV_SSHD_PORT={{ sshd_port }}
+    export PATH=/opt/hpcdev/bin:/opt/conda/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 %runscript
-    cd /workspace
-    exec uv run "$@"
+    #!/usr/bin/env bash
+    exec /opt/hpcdev/bin/hpcdev "$@"
+
+%startscript
+    #!/usr/bin/env bash
+    exec /opt/hpcdev/bin/hpcdev start-sshd

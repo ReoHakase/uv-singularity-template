@@ -9,9 +9,13 @@ wheels/
 # Virtual environments
 .venv
 .venv-sif/
+.direnv/
 
 # Singularity
-*.sif
+container.sif
+.container/
+hpcdev.sif
+.hpcdev/
 
 # IDE
 !.vscode/

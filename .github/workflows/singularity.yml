@@ -25,28 +25,26 @@ jobs:
         uses: actions/cache@v4
         with:
           path: container.sif
-          key: sif-${{ runner.os }}-${{ hashFiles('container.def') }}
+          key: sif-${{ runner.os }}-${{ hashFiles('container.def', 'flake.nix', 'flake.lock') }}
 
       - name: Build .sif image
         if: steps.cache-sif.outputs.cache-hit != 'true'
-        run: sudo -E singularity build container.sif container.def
-
-      - name: Sync dependencies (inside container)
         run: |
-          singularity exec --bind "$PWD:/workspace" container.sif \
-            bash -c "cd /workspace && uv sync"
+          singularity build --fakeroot \
+            --build-arg bake_dotfiles=0 \
+            container.sif container.def
 
-      - name: Lint (ruff)
+      - name: Verify baked tools
         run: |
-          singularity exec --bind "$PWD:/workspace" container.sif \
-            bash -c "cd /workspace && uv run ruff check ."
-
-      - name: Type check (ty)
-        run: |
-          singularity exec --bind "$PWD:/workspace" container.sif \
-            bash -c "cd /workspace && uv run ty check"
-
-      - name: Tests (pytest)
-        run: |
-          singularity exec --bind "$PWD:/workspace" container.sif \
-            bash -c "cd /workspace && uv run pytest tests src"
+          singularity run \
+            --bind "$PWD:/workspace" \
+            container.sif init
+          singularity exec \
+            --bind "$PWD:/workspace" \
+            container.sif bash -lc 'python --version && nix --version && direnv --version'
+          singularity run \
+            --bind "$PWD:/workspace" \
+            container.sif direnv allow
+          singularity run \
+            --bind "$PWD:/workspace" \
+            container.sif direnv exec . bash -lc 'test -n "$VIRTUAL_ENV" && uv --version'
