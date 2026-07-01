@@ -22,7 +22,7 @@ jobs:
 
       - name: Cache .sif image
         id: cache-sif
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: container.sif
           key: sif-${{ runner.os }}-${{ hashFiles('container.def', 'flake.nix', 'flake.lock') }}
